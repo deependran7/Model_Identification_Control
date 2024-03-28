@@ -1,0 +1,270 @@
+#include <Arduino.h>
+#include <ESP32SharpIR.h>
+#include <ArduinoEigen.h>
+#include <ArduinoEigenDense.h>
+#include <ArduinoEigenSparse.h>
+
+
+using namespace Eigen;
+
+
+
+// for motor driver 
+#define PIN_IN1  27 // ESP32 pin GPIO19 connected to the IN1 pin L298N
+#define PIN_IN2  26 // ESP32 pin GPIO18 connected to the IN2 pin L298N
+#define PIN_ENA  25 // ESP32 pin GPIO17 connected to the EN1 pin L298N
+
+// for encoder
+#define encoderPin1  19 //Encoder Output 'A' must connected with intreput pin of arduino.
+#define encoderPin2  18 //Encoder Otput 'B' must connected with intreput pin of arduino
+#define pi 3.141592
+
+void read_position_A(); 
+void read_position_B();
+void Rotate_Motor(float);
+float pidController(float,float,float,float);
+float get_filter_distance(float);
+
+
+ESP32SharpIR distance_sensor( ESP32SharpIR::GP2Y0A21YK0F, 13);
+
+// for measuremtn
+volatile long encoderPos = 0;    // encoder 1
+
+float motor_angle = 0;
+float motor_velocity = 0;
+float motor_angle_prev = 0;
+float motor_set_angle = 0.0;
+
+
+// for some math
+Eigen::MatrixXd A {{ 1.00003346,  0.00869153,  0.        ,  0.        },
+                   {-0.00005471,  0.94869392,  0.        ,  0.        },
+                   {-0.05208254, -0.00020257,  1.00841692,  0.00620441},
+                   {-4.69295415, -0.02193541,  0.76028616,  0.664674  }};
+
+                  
+                   
+
+
+Eigen::VectorXd B {{0.00009604,  0.00412789, -0.00000206, -0.00022606}};
+Eigen::MatrixXd C = Eigen::MatrixXd::Identity(4,4);
+
+
+//for kalman Estimator filter parameters
+Eigen::MatrixXd L {{ 1.00003346,  0.00869153,  0.        , -0.        },
+                   {-0.00005471,  0.94869392,  0.        ,  0.        },
+                   {-0.05208254, -0.00020257,  1.00841692,  0.00620441},
+                   {-4.69295415, -0.02193541,  0.76028616,  0.664674 }};
+// for state feedback parameter
+Eigen::RowVectorXd K {{118.27615106,  12.61724319, -22.23420202,  -0.40374243}};
+
+Eigen::VectorXd Xest {{0.0, 0.0, 0.0,0.0}};
+Eigen::VectorXd Yest {{0.0, 0.0, 0.0,0.0}};
+
+float motor_model_angle = 0;
+float motor_model_velocity = 0;
+float ball_model_distance = 0.0;
+float ball_model_velocity = 0.0;
+
+
+
+// for time calculation
+long currentTime = 0;
+long previousTime = 0;
+float deltaT = 0;
+
+// pid
+// pid parameter
+float kp = 5*180/pi;
+float ki = 2*180/pi;
+
+float eIntegral = 0.0;
+float ePrevious = 0.0;
+
+
+// 
+float ball_distance = 0.0;
+float ball_velocity = 0.0;
+float ball_prev_distance = 0.0;
+
+
+// filter	
+const int RunningAverageCount = 50;
+float RunningAverageBuffer[RunningAverageCount];
+int NextRunningAverage;
+
+
+
+void setup() {
+  // initialize digital pins as outputs.
+  Serial.begin(115200);
+  distance_sensor.setFilterRate(0.2f); 
+  //for motor
+  pinMode(PIN_IN1, OUTPUT);
+  pinMode(PIN_IN2, OUTPUT);
+  pinMode(PIN_ENA, OUTPUT);
+  //for encoder pins
+  attachInterrupt(digitalPinToInterrupt(encoderPin1), read_position_A, CHANGE);
+  attachInterrupt(digitalPinToInterrupt(encoderPin2), read_position_B, CHANGE);
+    
+ }
+
+// the loop function runs over and over again forever
+void loop() {
+  currentTime = millis();
+  deltaT = ((float)(currentTime - previousTime))/1.0e3; // sample time Ts
+  
+  // calculation of ball distance and velocity
+  float ball_distance_raw = distance_sensor.getDistanceFloat(); 
+  ball_distance = get_filter_distance(ball_distance_raw);
+  ball_velocity = (ball_distance - ball_prev_distance)/(deltaT);  
+  
+  // measuring angle and velocity of motor
+  motor_angle = encoderPos*pi/(140*2); // 140 counts per 90 degrees // result in radians
+  motor_velocity = (motor_angle - motor_angle_prev)/(deltaT); //degrees per second times pi/180 for rad/sec and 
+
+
+  // setting the reference point
+   float ref_ball_position = 20;
+  //estimation
+  Eigen::VectorXd Ymeas {{motor_angle,motor_velocity,ball_distance,ball_velocity}};
+  //reference set
+  Xest(2) = -Xest(2) + ref_ball_position;
+  //quadratic regulator
+  VectorXd u = -K*Xest;
+  Yest  = C*Xest;
+  VectorXd e = Ymeas - Yest;
+  Xest = A*Xest+B*u + L*e;
+  
+  
+
+  Rotate_Motor(u(0));
+  
+  
+  
+  //print the data here
+  Serial.print(currentTime);
+  Serial.print(",");
+  Serial.print(motor_angle);
+  Serial.print(",");
+  Serial.print(Xest(0));
+  Serial.print(",");
+  Serial.print(ball_distance);
+  Serial.print(",");
+  Serial.print(Xest(2));
+  Serial.print(",");
+  Serial.print(u(0));
+  Serial.print("\n");
+
+  // update the values
+  motor_angle_prev = motor_angle;
+  ball_prev_distance = ball_distance;
+  previousTime = currentTime;
+  
+  delay(5);
+}
+
+float pidController(float target, float variable, float kp, float ki) {
+    float e = target-variable;
+    eIntegral = eIntegral + e*deltaT;
+    float u = (kp*e)+ (ki*eIntegral);
+    ePrevious = e;
+    return u;
+ }  
+
+
+// for reading the angle and velocity of the motor
+void read_position_A(){
+  // look for a low-to-high on channel A
+  if (digitalRead(encoderPin1) == HIGH) { 
+    // check channel B to see which way encoder is turning
+    if (digitalRead(encoderPin2) == LOW) {  
+      encoderPos = encoderPos + 1;         // CW
+ 
+    } 
+    else {
+      encoderPos = encoderPos - 1;         // CCW
+      
+    }
+  }
+  else   // must be a high-to-low edge on channel A                                       
+  { 
+    // check channel B to see which way encoder is turning  
+    if (digitalRead(encoderPin2) == HIGH) {   
+      encoderPos = encoderPos + 1;          // CW
+      
+    } 
+    else {
+      encoderPos = encoderPos - 1;          // CCW
+       
+    }
+  } 
+             }
+
+
+  void read_position_B(){  
+
+  // look for a low-to-high on channel B
+  if (digitalRead(encoderPin2) == HIGH) {   
+   // check channel A to see which way encoder is turning
+    if (digitalRead(encoderPin1) == HIGH) {  
+      encoderPos = encoderPos + 1;         // CW
+      
+    } 
+    else {
+      encoderPos = encoderPos - 1;         // CCW
+      
+    }
+  }
+  // Look for a high-to-low on channel B
+  else { 
+    // check channel B to see which way encoder is turning  
+    if (digitalRead(encoderPin1) == LOW) {   
+      encoderPos = encoderPos + 1;          // CW
+      
+    } 
+    else {
+      encoderPos = encoderPos - 1;          // CCW
+       
+    }
+  }}
+
+
+void Rotate_Motor(float speed_val){
+  float vel = fabs(speed_val);
+  if (vel > 200){
+      vel = 200;
+    }
+ 
+  if (speed_val > 0 ) // 1 for clockwise -1 for anticlockwise
+  {
+  digitalWrite(PIN_IN1, LOW); // control the motor's direction in clockwise
+  digitalWrite(PIN_IN2, HIGH);  // control the motor's direction in clockwise
+  analogWrite(PIN_ENA, abs(vel));
+  
+    }
+ if (speed_val < 0 ) {
+  digitalWrite(PIN_IN1, HIGH); // control the motor's direction in clockwise
+  digitalWrite(PIN_IN2, LOW);  // control the motor's direction in clockwise
+  analogWrite(PIN_ENA, abs(vel));
+  }
+  }
+
+  float get_filter_distance(float ball_distance_raw){
+
+    RunningAverageBuffer[NextRunningAverage++] = ball_distance_raw;
+  if (NextRunningAverage >= RunningAverageCount)
+  {
+    NextRunningAverage = 0; 
+  }
+  float ball_distance = 0;
+  for(int i=0; i< RunningAverageCount; ++i)
+  {
+    ball_distance += RunningAverageBuffer[i];
+  }
+  ball_distance /= RunningAverageCount;
+
+  return ball_distance;
+  }
+
